@@ -53,18 +53,39 @@ if start_date >= end_date:
 # 선택된 주식 이름들을 yfinance 티커 목록으로 변환
 tickers = [stock_dict[name] for name in selected_stock_names]
 
-# 4. 데이터 불러오기 함수 (캐싱 적용으로 속도 향상)
+# 4. 데이터 불러오기 함수 (예외 처리를 대폭 강화한 버전)
 @st.cache_data
 def load_stock_data(tickers, start, end):
     if not tickers:
         return pd.DataFrame()
-    # 조정 종가(Adj Close) 기준으로 데이터를 가져옵니다.
-    data = yf.download(tickers, start=start, end=end)['Adj Close']
     
-    # 만약 하나의 주식만 선택했다면 Series가 반환되므로 DataFrame으로 변환해 줍니다.
-    if isinstance(data, pd.Series):
-        data = data.to_frame(name=tickers[0])
-    return data
+    try:
+        # auto_adjust=False를 설정하여 'Adj Close' 컬럼을 안전하게 가져오도록 시도합니다.
+        raw_data = yf.download(tickers, start=start, end=end, auto_adjust=False)
+        
+        if raw_data.empty:
+            return pd.DataFrame()
+        
+        # 1) 컬럼에서 'Adj Close'가 있는지 확인하고 가져옵니다.
+        # 만약 없으면 일반 'Close'를 가져오는 예외처리를 추가해 KeyError를 원천 차단합니다.
+        if 'Adj Close' in raw_data.columns:
+            data = raw_data['Adj Close']
+        elif 'Close' in raw_data.columns:
+            data = raw_data['Close']
+        else:
+            # 둘 다 없는 극단적인 상황에는 전체 데이터 프레임을 반환합니다.
+            data = raw_data
+            
+        # 2) 만약 주식이 딱 1개만 선택되었을 때, Series가 반환되는 현상을 방지하고 DataFrame으로 규격화합니다.
+        if isinstance(data, pd.Series):
+            data = data.to_frame(name=tickers[0])
+            
+        return data
+
+    except Exception as e:
+        # 어떤 에러가 발생했는지 웹 화면에 일시적으로 띄워줍니다.
+        st.error(f"데이터를 다운로드하는 중 에러가 발생했습니다: {e}")
+        return pd.DataFrame()
 
 # 5. 메인 화면 구현
 if tickers:
@@ -72,12 +93,19 @@ if tickers:
         df = load_stock_data(tickers, start_date, end_date)
 
     if not df.empty:
+        # 데이터프레임 복사본 생성
+        df_cleaned = df.copy()
+
+        # 만약 컬럼이 MultiIndex(여러 층으로 구성)라면, 마지막 층(티커명)만 남기고 단순화합니다.
+        if isinstance(df_cleaned.columns, pd.MultiIndex):
+            df_cleaned.columns = df_cleaned.columns.get_level_values(-1)
+
         # 컬럼명을 티커 기호 대신 보기 쉬운 한글 이름으로 변경합니다.
         ticker_to_name = {v: k for k, v in stock_dict.items()}
-        df.columns = [ticker_to_name.get(col, col) for col in df.columns]
+        df_cleaned.columns = [ticker_to_name.get(col, col) for col in df_cleaned.columns]
 
-        # 결측치 처리 (휴장일 등이 다를 수 있음)
-        df = df.ffill().bfill()
+        # 결측치 처리 (휴장일 등이 다를 수 있으므로 앞뒤 데이터로 채워줍니다)
+        df_cleaned = df_cleaned.ffill().bfill()
 
         # ---------------- Tabs 구성 ----------------
         tab1, tab2, tab3 = st.tabs(["📈 주가 차트", "🔄 누적 수익률 비교", "📊 요약 통계"])
@@ -85,7 +113,7 @@ if tickers:
         with tab1:
             st.subheader("일별 종가 추이")
             st.caption("각 주식이 거래되는 통화(원화 혹은 달러) 기준으로 표시됩니다.")
-            fig_price = px.line(df, labels={"value": "주가", "Date": "날짜"})
+            fig_price = px.line(df_cleaned, labels={"value": "주가", "Date": "날짜"})
             st.plotly_chart(fig_price, use_container_width=True)
 
         with tab2:
@@ -93,7 +121,7 @@ if tickers:
             st.caption("설정한 시작일의 주가를 0%로 잡고, 이후 주가가 얼마나 변했는지 비율로 비교합니다.")
             
             # 누적 수익률 계산 공식: (현재 가격 / 시작 가격 - 1) * 100
-            returns_df = (df / df.iloc[0] - 1) * 100
+            returns_df = (df_cleaned / df_cleaned.iloc[0] - 1) * 100
             
             fig_returns = px.line(returns_df, labels={"value": "누적 수익률 (%)", "Date": "날짜"})
             fig_returns.update_layout(yaxis_tickformat=".1f")
@@ -102,10 +130,10 @@ if tickers:
         with tab3:
             st.subheader("선택 기간 통계 요약")
             summary = pd.DataFrame({
-                "시작일 가격": df.iloc[0],
-                "마지막일 가격": df.iloc[-1],
-                "최고가": df.max(),
-                "최저가": df.min(),
+                "시작일 가격": df_cleaned.iloc[0],
+                "마지막일 가격": df_cleaned.iloc[-1],
+                "최고가": df_cleaned.max(),
+                "최저가": df_cleaned.min(),
                 "최종 누적 수익률 (%)": returns_df.iloc[-1]
             })
             st.dataframe(summary.style.format("{:,.2f}"))
@@ -114,12 +142,10 @@ if tickers:
         st.markdown("---")
         st.subheader("💡 스스로 생각해볼까요? (탐구 과제)")
         st.info(
-            "1. **단위의 함정**: 그냥 '주가 차트'를 봤을 때와 '누적 수익률 차트'를 봤을 때의 차이점은 무엇인가요? "
-            "왜 주식 비교를 할 때는 단순 가격보다 '수익률'을 비교하는 것이 더 합리적일까요?\n\n"
-            "2. **시장 지수와의 비교**: 여러분이 선택한 개별 주식의 상승/하락 흐름이 코스피 지수나 S&P 500 지수의 흐름과 얼마나 닮아 있나요? "
-            "이것을 금융학에서는 '체계적 위험(시장 변동성)'과 연결지어 설명하곤 합니다.\n\n"
-            "3. **환율 효과**: 이 프로그램은 미국 주식은 달러(USD), 한국 주식은 원화(KRW) 기준으로 계산합니다. "
-            "만약 환율 변동까지 반영한다면 실제 한국인 투자자의 수익률은 어떻게 달라질까요?"
+            "1. **예외 처리의 중요성**: 우리가 겪은 `KeyError`처럼, 외부 API(야후 파이낸스)가 전달해 주는 데이터 형식은 언제든 변할 수 있습니다. "
+            "이에 대비하는 '예외 처리(Exception Handling)' 코딩 습관이 왜 중요한지 직접 에러를 해결해 보며 느낀 점을 적어보세요!\n\n"
+            "2. **누적 수익률의 유용성**: 원화 단위인 한국 주식과 달러 단위인 미국 주식을 하나의 차트에서 직접 비교하는 것이 왜 어려우며, "
+            "이를 '누적 수익률'로 변환했을 때 어떤 분석이 가능해지는지 탐구해 보세요."
         )
     else:
         st.error("데이터를 불러오는 데 실패했습니다. 선택한 기간이 너무 짧거나 주식 시장이 열리지 않은 날인지 확인해 주세요.")
